@@ -1,60 +1,82 @@
 """
-Shared HTTP retry helper.
+ATS watchlist loading.
 
-Every connector (Jooble, Greenhouse, Lever, Ashby, and any future
-source) needs the same retry/backoff behaviour on network failures
-and 5xx responses. Factored out here rather than duplicated per
-connector.
+Greenhouse, Lever, and Ashby are all polled per-company via a known
+board slug - there's no keyword search across companies. This module
+loads that slug list from a small JSON file (config/ats_watchlist.json)
+so new companies can be added without touching code.
+
+Each entry pairs a slug with a company_name, because ATS responses
+don't include the company's display name - you already have to know
+it, since you're querying by slug in the URL.
 """
 from __future__ import annotations
 
-import time
+import json
+from dataclasses import dataclass
+from pathlib import Path
 
-import requests
-
-from exceptions import SourceError
 from utils.logger import get_logger
 
 logger = get_logger(__name__)
 
-_DEFAULT_MAX_RETRIES = 3
-_DEFAULT_BACKOFF_SECONDS = 2
+_SUPPORTED_PLATFORMS = ("greenhouse", "lever", "ashby")
 
 
-def fetch_json_with_retry(
-    session: requests.Session,
-    method: str,
-    url: str,
-    *,
-    source_name: str,
-    json: dict | None = None,
-    timeout: int = 10,
-    max_retries: int = _DEFAULT_MAX_RETRIES,
-    backoff_seconds: int = _DEFAULT_BACKOFF_SECONDS,
-) -> dict | list:
-    """Make an HTTP request, retrying on network errors and 5xx/4xx
-    failures with linear backoff. Returns the parsed JSON body.
+class AtsWatchlistError(Exception):
+    """Raised when the ATS watchlist file is missing or malformed."""
+
+
+@dataclass(frozen=True)
+class AtsTarget:
+    """A single company to poll on a given ATS platform."""
+
+    slug: str
+    company_name: str
+
+
+def load_ats_watchlist(path: Path) -> dict[str, tuple[AtsTarget, ...]]:
+    """Load the ATS watchlist file into per-platform tuples of AtsTarget.
+
+    Returns a dict with keys "greenhouse", "lever", "ashby", each
+    mapping to a (possibly empty) tuple of AtsTarget. A platform with
+    no entries configured simply gets an empty tuple - callers use
+    that to decide whether to build a connector for it at all.
 
     Raises:
-        SourceError: if every attempt fails.
+        AtsWatchlistError: if the file is missing, isn't valid JSON,
+            or an entry is missing "slug"/"company_name".
     """
-    last_error: Exception | None = None
-    for attempt in range(1, max_retries + 1):
-        try:
-            response = session.request(method, url, json=json, timeout=timeout)
-            response.raise_for_status()
-            return response.json()
-        except (requests.RequestException, ValueError) as exc:
-            last_error = exc
-            logger.warning(
-                "%s request failed (attempt %d/%d) for %s: %s",
-                source_name,
-                attempt,
-                max_retries,
-                url,
-                exc,
-            )
-            if attempt < max_retries:
-                time.sleep(backoff_seconds * attempt)
+    try:
+        raw_text = path.read_text(encoding="utf-8")
+    except OSError as exc:
+        raise AtsWatchlistError(f"Could not read ATS watchlist file {path}: {exc}") from exc
 
-    raise SourceError(f"{source_name} request failed for {url}: {last_error}")
+    try:
+        raw_data = json.loads(raw_text)
+    except json.JSONDecodeError as exc:
+        raise AtsWatchlistError(f"ATS watchlist file {path} is not valid JSON: {exc}") from exc
+
+    result: dict[str, tuple[AtsTarget, ...]] = {}
+    for platform in _SUPPORTED_PLATFORMS:
+        entries = raw_data.get(platform, [])
+        if not isinstance(entries, list):
+            raise AtsWatchlistError(
+                f"ATS watchlist file {path}: {platform!r} must be a list, got {type(entries).__name__}."
+            )
+
+        targets: list[AtsTarget] = []
+        for entry in entries:
+            slug = str(entry.get("slug", "")).strip()
+            company_name = str(entry.get("company_name", "")).strip()
+            if not slug or not company_name:
+                raise AtsWatchlistError(
+                    f"ATS watchlist file {path}: each {platform!r} entry needs a non-empty "
+                    f"'slug' and 'company_name', got {entry!r}."
+                )
+            targets.append(AtsTarget(slug=slug, company_name=company_name))
+
+        result[platform] = tuple(targets)
+        logger.info("Loaded %d %s watchlist target(s) from %s", len(targets), platform, path)
+
+    return result

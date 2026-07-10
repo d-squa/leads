@@ -1,112 +1,129 @@
 """
-Greenhouse connector.
+Jooble connector.
 
-Implements JobSource against Greenhouse's public Job Board API:
-    GET https://boards-api.greenhouse.io/v1/boards/{board_token}/jobs?content=true
-    response: {"jobs": [{"id", "title", "updated_at", "location": {"name"},
-               "absolute_url", "content"}], "meta": {"total": N}}
-No authentication required for read access.
+Implements JobSource against Jooble's REST API:
+    POST https://jooble.org/api/{api_key}
+    body: {"keywords": "...", "location": "...", "page": "1"}
+    response: {"totalCount": int, "jobs": [{"title", "location",
+               "snippet", "salary", "source", "type", "link",
+               "company", "updated", "id"}, ...]}
 
-Unlike Jooble/Adzuna, this is not a keyword search - it fetches every
-open job for a known company slug. search_terms and countries are
-ignored; the companies to poll come from the ATS watchlist
-(config/ats_watchlist.json) instead. Title relevance filtering still
-happens downstream in core/job_filter.py, same as any other source.
-
-Reference: https://developers.greenhouse.io/job-board.html
+Reference: https://help.jooble.org/en/support/solutions/articles/60001448238
 """
 from __future__ import annotations
 
 import re
-from datetime import date, datetime
+from datetime import date
 
 import requests
 
+from exceptions import SourceError
 from models.job import Job
-from sources.ats_watchlist import AtsTarget
 from sources.base import JobSource
 from sources.http_utils import fetch_json_with_retry
 from utils.logger import get_logger
 
 logger = get_logger(__name__)
 
-_URL_TEMPLATE = "https://boards-api.greenhouse.io/v1/boards/{board_token}/jobs"
+_BASE_URL = "https://jooble.org/api/{api_key}"
 _TIMEOUT_SECONDS = 10
-_HTML_TAG_PATTERN = re.compile(r"<[^>]+>")
+_LEADING_DATE_PATTERN = re.compile(r"^(\d{4}-\d{2}-\d{2})")
 
 
-def _strip_html(html: str) -> str:
-    """Lightweight HTML-to-text conversion for job descriptions.
-    Not a full sanitizer - just enough to store a readable description
-    without pulling in a heavy HTML parsing dependency."""
-    text = _HTML_TAG_PATTERN.sub(" ", html)
-    return " ".join(text.split())
+class JoobleSource(JobSource):
+    """Discovery source backed by the Jooble job search API."""
 
+    name = "jooble"
 
-class GreenhouseSource(JobSource):
-    """ATS-direct source backed by Greenhouse's public Job Board API."""
-
-    name = "greenhouse"
-
-    def __init__(self, targets: tuple[AtsTarget, ...], session: requests.Session | None = None) -> None:
-        if not targets:
-            raise ValueError("GreenhouseSource requires at least one watchlist target")
-        self._targets = targets
+    def __init__(self, api_key: str, session: requests.Session | None = None) -> None:
+        if not api_key:
+            raise ValueError("JoobleSource requires a non-empty api_key")
+        self._api_key = api_key
         self._session = session or requests.Session()
+        self._url = _BASE_URL.format(api_key=api_key)
 
     def fetch_jobs(self, search_terms: tuple[str, ...], countries: tuple[str, ...]) -> list[Job]:
-        """Fetch every open job for each watchlisted company. Ignores
-        search_terms/countries - Greenhouse has no keyword search;
-        relevance filtering happens downstream in core/job_filter.py."""
+        """Fetch jobs for all search terms, once per country.
+
+        Jooble's `keywords` field accepts a comma-separated list treated
+        as a single search, so all search_terms are sent together in
+        one request per country rather than one request per term - this
+        keeps request volume low against the free-tier quota.
+        """
+        keywords = ", ".join(search_terms)
+        # If no countries are configured, do a single unscoped search.
+        locations: tuple[str, ...] = countries or ("",)
+
         jobs: list[Job] = []
-        for target in self._targets:
-            raw_jobs = self._fetch_board(target.slug)
+        for location in locations:
+            raw_jobs = self._search(keywords=keywords, location=location)
             for raw_job in raw_jobs:
-                job = self._normalize(raw_job, target.company_name)
+                job = self._normalize(raw_job)
                 if job is not None:
                     jobs.append(job)
         return jobs
 
-    def _fetch_board(self, board_token: str) -> list[dict]:
-        url = _URL_TEMPLATE.format(board_token=board_token) + "?content=true"
+    def _search(self, keywords: str, location: str) -> list[dict]:
+        """POST a single search request with retry/backoff. Raises
+        SourceError if all attempts fail."""
+        payload = {"keywords": keywords, "location": location, "page": "1"}
         data = fetch_json_with_retry(
-            self._session, "GET", url, source_name="Greenhouse", timeout=_TIMEOUT_SECONDS
+            self._session,
+            "POST",
+            self._url,
+            source_name="Jooble",
+            json=payload,
+            timeout=_TIMEOUT_SECONDS,
         )
         return data.get("jobs", []) if isinstance(data, dict) else []
 
-    def _normalize(self, raw_job: dict, company_name: str) -> Job | None:
+    def _normalize(self, raw_job: dict) -> Job | None:
+        """Convert a raw Jooble job dict into a Job. Returns None and
+        logs a warning if required fields are missing, rather than
+        raising - one malformed entry shouldn't drop the whole batch."""
         try:
+            company = (raw_job.get("company") or "").strip()
             title = (raw_job.get("title") or "").strip()
-            job_url = (raw_job.get("absolute_url") or "").strip()
-            if not title or not job_url:
-                logger.warning("Skipping Greenhouse job missing required fields: %r", raw_job)
+            job_url = (raw_job.get("link") or "").strip()
+
+            if not company or not title or not job_url:
+                logger.warning("Skipping Jooble job missing required fields: %r", raw_job)
                 return None
 
-            location = ((raw_job.get("location") or {}).get("name") or "").strip()
-            raw_description = raw_job.get("content") or ""
-
             return Job(
-                company=company_name,
+                company=company,
                 job_title=title,
-                location=location,
-                country="Unknown",
+                location=(raw_job.get("location") or "").strip(),
+                country="Unknown",  # resolved later by core/location parsing
                 source=self.name,
                 job_url=job_url,
-                posted_date=self._parse_date(raw_job.get("updated_at")),
-                description=_strip_html(raw_description),
+                posted_date=self._parse_date(raw_job.get("updated")),
+                description=(raw_job.get("snippet") or "").strip(),
             )
-        except Exception as exc:  # defensive: one bad record shouldn't break the batch
-            logger.warning("Failed to normalize Greenhouse job %r: %s", raw_job, exc)
+        except Exception as exc:  # defensive: never let one bad record break the batch
+            logger.warning("Failed to normalize Jooble job %r: %s", raw_job, exc)
             return None
 
     @staticmethod
     def _parse_date(raw_value: str | None) -> date | None:
-        """Parse Greenhouse's ISO-8601 updated_at, e.g. '2013-07-02T19:39:23Z'
-        or with a numeric UTC offset."""
+        """Best-effort parse of Jooble's 'updated' timestamp string.
+
+        Jooble's timestamp precision is inconsistent in practice - plain
+        dates, full datetimes, and datetimes with fractional seconds of
+        varying digit counts (including 7-digit fractions, which
+        strptime's %f cannot parse - it only supports up to 6). Since
+        Job.posted_date only needs date precision, sidestep the whole
+        problem by extracting just the leading YYYY-MM-DD rather than
+        trying to parse every timestamp variant Jooble might send.
+        """
         if not raw_value:
             return None
+        match = _LEADING_DATE_PATTERN.match(raw_value)
+        if not match:
+            logger.warning("Could not parse Jooble date value: %r", raw_value)
+            return None
         try:
-            return datetime.fromisoformat(raw_value.replace("Z", "+00:00")).date()
+            return date.fromisoformat(match.group(1))
         except ValueError:
-            logger.warning("Could not parse Greenhouse date value: %r", raw_value)
+            logger.warning("Could not parse Jooble date value: %r", raw_value)
             return None

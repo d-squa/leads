@@ -1,24 +1,23 @@
 """
-Lever connector.
+Ashby connector.
 
-Implements JobSource against Lever's public Postings API:
-    GET https://api.lever.co/v0/postings/{company}?mode=json
-    response: a plain JSON array (not wrapped in an object) of
-    postings: [{"id", "text", "hostedUrl", "applyUrl",
-                "categories": {"team", "location", "commitment"},
-                "createdAt" (epoch ms), "descriptionPlain",
-                "workplaceType"}, ...]
+Implements JobSource against Ashby's public Job Postings API:
+    GET https://api.ashbyhq.com/posting-api/job-board/{job_board_name}
+    response: {"apiVersion": "1", "jobs": [{"title", "location",
+               "department", "team", "isRemote", "workplaceType",
+               "descriptionPlain", "publishedAt", "employmentType",
+               "jobUrl", "applyUrl"}, ...]}
 No authentication required for read access.
 
-Like Greenhouse, this fetches every open posting for a known company
-slug rather than searching by keyword. search_terms/countries are
-ignored; companies come from the ATS watchlist.
+Like Greenhouse/Lever, this fetches every open posting for a known
+company slug rather than searching by keyword. search_terms/countries
+are ignored; companies come from the ATS watchlist.
 
-Reference: https://github.com/lever/postings-api
+Reference: https://developers.ashbyhq.com/docs/public-job-posting-api
 """
 from __future__ import annotations
 
-from datetime import date, datetime, timezone
+from datetime import date, datetime
 
 import requests
 
@@ -30,18 +29,18 @@ from utils.logger import get_logger
 
 logger = get_logger(__name__)
 
-_URL_TEMPLATE = "https://api.lever.co/v0/postings/{company}?mode=json"
+_URL_TEMPLATE = "https://api.ashbyhq.com/posting-api/job-board/{job_board_name}"
 _TIMEOUT_SECONDS = 10
 
 
-class LeverSource(JobSource):
-    """ATS-direct source backed by Lever's public Postings API."""
+class AshbySource(JobSource):
+    """ATS-direct source backed by Ashby's public Job Postings API."""
 
-    name = "lever"
+    name = "ashby"
 
     def __init__(self, targets: tuple[AtsTarget, ...], session: requests.Session | None = None) -> None:
         if not targets:
-            raise ValueError("LeverSource requires at least one watchlist target")
+            raise ValueError("AshbySource requires at least one watchlist target")
         self._targets = targets
         self._session = session or requests.Session()
 
@@ -51,32 +50,29 @@ class LeverSource(JobSource):
         in core/job_filter.py."""
         jobs: list[Job] = []
         for target in self._targets:
-            raw_postings = self._fetch_postings(target.slug)
+            raw_postings = self._fetch_board(target.slug)
             for raw_posting in raw_postings:
                 job = self._normalize(raw_posting, target.company_name)
                 if job is not None:
                     jobs.append(job)
         return jobs
 
-    def _fetch_postings(self, company_slug: str) -> list[dict]:
-        url = _URL_TEMPLATE.format(company=company_slug)
+    def _fetch_board(self, job_board_name: str) -> list[dict]:
+        url = _URL_TEMPLATE.format(job_board_name=job_board_name)
         data = fetch_json_with_retry(
-            self._session, "GET", url, source_name="Lever", timeout=_TIMEOUT_SECONDS
+            self._session, "GET", url, source_name="Ashby", timeout=_TIMEOUT_SECONDS
         )
-        # Lever returns a bare array, unlike Jooble/Greenhouse/Ashby's
-        # object-wrapped responses.
-        return data if isinstance(data, list) else []
+        return data.get("jobs", []) if isinstance(data, dict) else []
 
     def _normalize(self, raw_posting: dict, company_name: str) -> Job | None:
         try:
-            title = (raw_posting.get("text") or "").strip()
-            job_url = (raw_posting.get("hostedUrl") or raw_posting.get("applyUrl") or "").strip()
+            title = (raw_posting.get("title") or "").strip()
+            job_url = (raw_posting.get("jobUrl") or raw_posting.get("applyUrl") or "").strip()
             if not title or not job_url:
-                logger.warning("Skipping Lever posting missing required fields: %r", raw_posting)
+                logger.warning("Skipping Ashby posting missing required fields: %r", raw_posting)
                 return None
 
-            categories = raw_posting.get("categories") or {}
-            location = (categories.get("location") or "").strip()
+            location = (raw_posting.get("location") or "").strip()
 
             return Job(
                 company=company_name,
@@ -85,20 +81,21 @@ class LeverSource(JobSource):
                 country="Unknown",
                 source=self.name,
                 job_url=job_url,
-                posted_date=self._parse_created_at(raw_posting.get("createdAt")),
+                posted_date=self._parse_date(raw_posting.get("publishedAt")),
                 description=(raw_posting.get("descriptionPlain") or "").strip(),
             )
         except Exception as exc:  # defensive: one bad record shouldn't break the batch
-            logger.warning("Failed to normalize Lever posting %r: %s", raw_posting, exc)
+            logger.warning("Failed to normalize Ashby posting %r: %s", raw_posting, exc)
             return None
 
     @staticmethod
-    def _parse_created_at(raw_value: object) -> date | None:
-        """Lever's createdAt is a millisecond epoch timestamp (int)."""
-        if raw_value is None:
+    def _parse_date(raw_value: str | None) -> date | None:
+        """Ashby's publishedAt is ISO-8601 with milliseconds and offset,
+        e.g. '2021-04-30T16:21:55.393+00:00'."""
+        if not raw_value:
             return None
         try:
-            return datetime.fromtimestamp(int(raw_value) / 1000, tz=timezone.utc).date()
-        except (TypeError, ValueError, OverflowError):
-            logger.warning("Could not parse Lever createdAt value: %r", raw_value)
+            return datetime.fromisoformat(raw_value).date()
+        except ValueError:
+            logger.warning("Could not parse Ashby date value: %r", raw_value)
             return None
