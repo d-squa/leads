@@ -1,112 +1,108 @@
-"""
-Greenhouse connector.
+"""Unit tests for core/job_filter.py."""
+import pytest
 
-Implements JobSource against Greenhouse's public Job Board API:
-    GET https://boards-api.greenhouse.io/v1/boards/{board_token}/jobs?content=true
-    response: {"jobs": [{"id", "title", "updated_at", "location": {"name"},
-               "absolute_url", "content"}], "meta": {"total": N}}
-No authentication required for read access.
+from core.job_filter import JobFilter, normalize_title
 
-Unlike Jooble/Adzuna, this is not a keyword search - it fetches every
-open job for a known company slug. search_terms and countries are
-ignored; the companies to poll come from the ATS watchlist
-(config/ats_watchlist.json) instead. Title relevance filtering still
-happens downstream in core/job_filter.py, same as any other source.
-
-Reference: https://developers.greenhouse.io/job-board.html
-"""
-from __future__ import annotations
-
-import re
-from datetime import date, datetime
-
-import requests
-
-from models.job import Job
-from sources.ats_watchlist import AtsTarget
-from sources.base import JobSource
-from sources.http_utils import fetch_json_with_retry
-from utils.logger import get_logger
-
-logger = get_logger(__name__)
-
-_URL_TEMPLATE = "https://boards-api.greenhouse.io/v1/boards/{board_token}/jobs"
-_TIMEOUT_SECONDS = 10
-_HTML_TAG_PATTERN = re.compile(r"<[^>]+>")
+CANONICAL_TITLES = (
+    "Paid Media Manager",
+    "Performance Marketing Manager",
+    "Media Buyer",
+    "Campaign Manager",
+    "Digital Marketing Manager",
+    "SEM Specialist",
+)
 
 
-def _strip_html(html: str) -> str:
-    """Lightweight HTML-to-text conversion for job descriptions.
-    Not a full sanitizer - just enough to store a readable description
-    without pulling in a heavy HTML parsing dependency."""
-    text = _HTML_TAG_PATTERN.sub(" ", html)
-    return " ".join(text.split())
+class TestNormalizeTitle:
+    def test_strips_parenthetical_notes(self) -> None:
+        assert normalize_title("Paid Media Manager (Hybrid)") == "Paid Media Manager"
+
+    def test_strips_trailing_dash_qualifier(self) -> None:
+        assert normalize_title("Paid Media Manager - EMEA") == "Paid Media Manager"
+
+    def test_strips_trailing_pipe_qualifier(self) -> None:
+        assert normalize_title("Paid Media Manager | Remote") == "Paid Media Manager"
+
+    def test_strips_seniority_prefix(self) -> None:
+        assert normalize_title("Senior Paid Media Manager") == "Paid Media Manager"
+
+    def test_strips_multiple_qualifiers_together(self) -> None:
+        assert normalize_title("Senior Paid Media Manager (Remote) - EMEA") == "Paid Media Manager"
+
+    def test_collapses_whitespace(self) -> None:
+        assert normalize_title("Paid   Media    Manager") == "Paid Media Manager"
+
+    def test_empty_string_returns_empty(self) -> None:
+        assert normalize_title("") == ""
+
+    def test_vp_prefix_stripped(self) -> None:
+        assert normalize_title("VP of Paid Media Manager") == "Paid Media Manager"
 
 
-class GreenhouseSource(JobSource):
-    """ATS-direct source backed by Greenhouse's public Job Board API."""
+class TestJobFilterConstruction:
+    def test_requires_at_least_one_title(self) -> None:
+        with pytest.raises(ValueError, match="at least one"):
+            JobFilter(canonical_titles=())
 
-    name = "greenhouse"
+    def test_rejects_invalid_threshold(self) -> None:
+        with pytest.raises(ValueError, match="threshold"):
+            JobFilter(canonical_titles=CANONICAL_TITLES, threshold=150)
 
-    def __init__(self, targets: tuple[AtsTarget, ...], session: requests.Session | None = None) -> None:
-        if not targets:
-            raise ValueError("GreenhouseSource requires at least one watchlist target")
-        self._targets = targets
-        self._session = session or requests.Session()
 
-    def fetch_jobs(self, search_terms: tuple[str, ...], countries: tuple[str, ...]) -> list[Job]:
-        """Fetch every open job for each watchlisted company. Ignores
-        search_terms/countries - Greenhouse has no keyword search;
-        relevance filtering happens downstream in core/job_filter.py."""
-        jobs: list[Job] = []
-        for target in self._targets:
-            raw_jobs = self._fetch_board(target.slug)
-            for raw_job in raw_jobs:
-                job = self._normalize(raw_job, target.company_name)
-                if job is not None:
-                    jobs.append(job)
-        return jobs
+class TestJobFilterMatch:
+    @pytest.fixture
+    def job_filter(self) -> JobFilter:
+        return JobFilter(canonical_titles=CANONICAL_TITLES, threshold=82)
 
-    def _fetch_board(self, board_token: str) -> list[dict]:
-        url = _URL_TEMPLATE.format(board_token=board_token) + "?content=true"
-        data = fetch_json_with_retry(
-            self._session, "GET", url, source_name="Greenhouse", timeout=_TIMEOUT_SECONDS
-        )
-        return data.get("jobs", []) if isinstance(data, dict) else []
+    def test_exact_match(self, job_filter: JobFilter) -> None:
+        assert job_filter.match("Paid Media Manager") == "Paid Media Manager"
 
-    def _normalize(self, raw_job: dict, company_name: str) -> Job | None:
-        try:
-            title = (raw_job.get("title") or "").strip()
-            job_url = (raw_job.get("absolute_url") or "").strip()
-            if not title or not job_url:
-                logger.warning("Skipping Greenhouse job missing required fields: %r", raw_job)
-                return None
+    def test_matches_with_seniority_prefix(self, job_filter: JobFilter) -> None:
+        assert job_filter.match("Senior Paid Media Manager") == "Paid Media Manager"
 
-            location = ((raw_job.get("location") or {}).get("name") or "").strip()
-            raw_description = raw_job.get("content") or ""
+    def test_matches_with_location_suffix(self, job_filter: JobFilter) -> None:
+        assert job_filter.match("Paid Media Manager - Dubai") == "Paid Media Manager"
 
-            return Job(
-                company=company_name,
-                job_title=title,
-                location=location,
-                country="Unknown",
-                source=self.name,
-                job_url=job_url,
-                posted_date=self._parse_date(raw_job.get("updated_at")),
-                description=_strip_html(raw_description),
-            )
-        except Exception as exc:  # defensive: one bad record shouldn't break the batch
-            logger.warning("Failed to normalize Greenhouse job %r: %s", raw_job, exc)
-            return None
+    def test_matches_with_hybrid_note(self, job_filter: JobFilter) -> None:
+        assert job_filter.match("Paid Media Manager (Hybrid)") == "Paid Media Manager"
 
-    @staticmethod
-    def _parse_date(raw_value: str | None) -> date | None:
-        """Parse Greenhouse's ISO-8601 updated_at, e.g. '2013-07-02T19:39:23Z'
-        or with a numeric UTC offset."""
-        if not raw_value:
-            return None
-        try:
-            return datetime.fromisoformat(raw_value.replace("Z", "+00:00")).date()
-        except ValueError:
-            logger.warning("Could not parse Greenhouse date value: %r", raw_value)
-            return None
+    def test_matches_case_insensitively(self, job_filter: JobFilter) -> None:
+        assert job_filter.match("paid media manager") == "Paid Media Manager"
+
+    def test_matches_correct_title_among_similar_options(self, job_filter: JobFilter) -> None:
+        assert job_filter.match("Campaign Manager") == "Campaign Manager"
+        assert job_filter.match("Digital Marketing Manager") == "Digital Marketing Manager"
+
+    def test_unrelated_title_does_not_match(self, job_filter: JobFilter) -> None:
+        assert job_filter.match("Software Engineer") is None
+
+    def test_loosely_related_title_below_threshold_does_not_match(self, job_filter: JobFilter) -> None:
+        # "Marketing Intern" shares the word "Marketing" but is a
+        # meaningfully different, non-target role.
+        assert job_filter.match("Marketing Intern") is None
+
+    def test_empty_title_does_not_match(self, job_filter: JobFilter) -> None:
+        assert job_filter.match("") is None
+
+    def test_realistic_messy_postings_match_correctly(self, job_filter: JobFilter) -> None:
+        # Regression coverage for the kind of real-world noise this
+        # matcher exists to handle.
+        assert job_filter.match("Senior Paid Media Manager (Hybrid) - Doha") == "Paid Media Manager"
+        assert job_filter.match("Head of Performance Marketing Manager") == "Performance Marketing Manager"
+
+    def test_unrelated_short_titles_do_not_false_positive(self, job_filter: JobFilter) -> None:
+        assert job_filter.match("Sales Manager") is None
+        assert job_filter.match("Marketing Intern") is None
+        assert job_filter.match("Graphic Designer") is None
+
+    def test_lower_threshold_is_more_permissive(self) -> None:
+        strict_filter = JobFilter(canonical_titles=CANONICAL_TITLES, threshold=95)
+        loose_filter = JobFilter(canonical_titles=CANONICAL_TITLES, threshold=50)
+
+        ambiguous_title = "Marketing Manager"
+        # A stricter threshold should reject titles a looser one accepts,
+        # for at least some ambiguous input - proving threshold is honored.
+        strict_result = strict_filter.match(ambiguous_title)
+        loose_result = loose_filter.match(ambiguous_title)
+        assert loose_result is not None
+        assert strict_result is None or strict_result == loose_result

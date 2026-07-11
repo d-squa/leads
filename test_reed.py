@@ -1,129 +1,55 @@
 """
-Jooble connector.
+Job model.
 
-Implements JobSource against Jooble's REST API:
-    POST https://jooble.org/api/{api_key}
-    body: {"keywords": "...", "location": "...", "page": "1"}
-    response: {"totalCount": int, "jobs": [{"title", "location",
-               "snippet", "salary", "source", "type", "link",
-               "company", "updated", "id"}, ...]}
-
-Reference: https://help.jooble.org/en/support/solutions/articles/60001448238
+Every source connector (discovery or ATS) must normalize its raw
+response into this exact shape. No connector-specific fields are
+allowed to leak past the source layer - this is what lets core/,
+storage/, and everything downstream stay source-agnostic.
 """
 from __future__ import annotations
 
-import re
+import hashlib
+from dataclasses import dataclass
 from datetime import date
 
-import requests
 
-from exceptions import SourceError
-from models.job import Job
-from sources.base import JobSource
-from sources.http_utils import fetch_json_with_retry
-from utils.logger import get_logger
+@dataclass(frozen=True)
+class Job:
+    """A single, normalized job posting.
 
-logger = get_logger(__name__)
+    Attributes:
+        company: Company name as it appears in the posting.
+        job_title: Raw job title as posted (not yet matched/scored).
+        location: Human-readable location string (e.g. "Doha, Qatar").
+        country: Best-effort country name or ISO code; "Unknown" if
+            it could not be determined.
+        source: Identifier of the connector that produced this job,
+            e.g. "jooble", "adzuna", "greenhouse".
+        job_url: Canonical URL to the posting. Used as part of the
+            dedup key.
+        posted_date: Date the job was posted, if the source provides
+            it. None if unavailable.
+        description: Raw or lightly-cleaned job description text.
+    """
 
-_BASE_URL = "https://jooble.org/api/{api_key}"
-_TIMEOUT_SECONDS = 10
-_LEADING_DATE_PATTERN = re.compile(r"^(\d{4}-\d{2}-\d{2})")
+    company: str
+    job_title: str
+    location: str
+    country: str
+    source: str
+    job_url: str
+    posted_date: date | None
+    description: str
 
+    def dedup_hash(self) -> str:
+        """Stable hash used as the dedup key across daily runs.
 
-class JoobleSource(JobSource):
-    """Discovery source backed by the Jooble job search API."""
-
-    name = "jooble"
-
-    def __init__(self, api_key: str, session: requests.Session | None = None) -> None:
-        if not api_key:
-            raise ValueError("JoobleSource requires a non-empty api_key")
-        self._api_key = api_key
-        self._session = session or requests.Session()
-        self._url = _BASE_URL.format(api_key=api_key)
-
-    def fetch_jobs(self, search_terms: tuple[str, ...], countries: tuple[str, ...]) -> list[Job]:
-        """Fetch jobs for all search terms, once per country.
-
-        Jooble's `keywords` field accepts a comma-separated list treated
-        as a single search, so all search_terms are sent together in
-        one request per country rather than one request per term - this
-        keeps request volume low against the free-tier quota.
+        Built from company + normalized title + location + source
+        rather than job_url alone, since some ATS platforms reissue
+        the same posting under a new URL after edits.
         """
-        keywords = ", ".join(search_terms)
-        # If no countries are configured, do a single unscoped search.
-        locations: tuple[str, ...] = countries or ("",)
-
-        jobs: list[Job] = []
-        for location in locations:
-            raw_jobs = self._search(keywords=keywords, location=location)
-            for raw_job in raw_jobs:
-                job = self._normalize(raw_job)
-                if job is not None:
-                    jobs.append(job)
-        return jobs
-
-    def _search(self, keywords: str, location: str) -> list[dict]:
-        """POST a single search request with retry/backoff. Raises
-        SourceError if all attempts fail."""
-        payload = {"keywords": keywords, "location": location, "page": "1"}
-        data = fetch_json_with_retry(
-            self._session,
-            "POST",
-            self._url,
-            source_name="Jooble",
-            json=payload,
-            timeout=_TIMEOUT_SECONDS,
-        )
-        return data.get("jobs", []) if isinstance(data, dict) else []
-
-    def _normalize(self, raw_job: dict) -> Job | None:
-        """Convert a raw Jooble job dict into a Job. Returns None and
-        logs a warning if required fields are missing, rather than
-        raising - one malformed entry shouldn't drop the whole batch."""
-        try:
-            company = (raw_job.get("company") or "").strip()
-            title = (raw_job.get("title") or "").strip()
-            job_url = (raw_job.get("link") or "").strip()
-
-            if not company or not title or not job_url:
-                logger.warning("Skipping Jooble job missing required fields: %r", raw_job)
-                return None
-
-            return Job(
-                company=company,
-                job_title=title,
-                location=(raw_job.get("location") or "").strip(),
-                country="Unknown",  # resolved later by core/location parsing
-                source=self.name,
-                job_url=job_url,
-                posted_date=self._parse_date(raw_job.get("updated")),
-                description=(raw_job.get("snippet") or "").strip(),
-            )
-        except Exception as exc:  # defensive: never let one bad record break the batch
-            logger.warning("Failed to normalize Jooble job %r: %s", raw_job, exc)
-            return None
-
-    @staticmethod
-    def _parse_date(raw_value: str | None) -> date | None:
-        """Best-effort parse of Jooble's 'updated' timestamp string.
-
-        Jooble's timestamp precision is inconsistent in practice - plain
-        dates, full datetimes, and datetimes with fractional seconds of
-        varying digit counts (including 7-digit fractions, which
-        strptime's %f cannot parse - it only supports up to 6). Since
-        Job.posted_date only needs date precision, sidestep the whole
-        problem by extracting just the leading YYYY-MM-DD rather than
-        trying to parse every timestamp variant Jooble might send.
-        """
-        if not raw_value:
-            return None
-        match = _LEADING_DATE_PATTERN.match(raw_value)
-        if not match:
-            logger.warning("Could not parse Jooble date value: %r", raw_value)
-            return None
-        try:
-            return date.fromisoformat(match.group(1))
-        except ValueError:
-            logger.warning("Could not parse Jooble date value: %r", raw_value)
-            return None
+        normalized_title = " ".join(self.job_title.lower().split())
+        normalized_company = " ".join(self.company.lower().split())
+        normalized_location = " ".join(self.location.lower().split())
+        raw = f"{normalized_company}|{normalized_title}|{normalized_location}|{self.source}"
+        return hashlib.sha256(raw.encode("utf-8")).hexdigest()

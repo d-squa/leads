@@ -1,31 +1,79 @@
-"""
-Standalone smoke test for the Reed connector.
+"""Unit tests for sources/ats_watchlist.py."""
+import json
 
-Not part of the automated test suite (no network access there). Run
-this locally, or via GitHub Actions workflow_dispatch, to confirm your
-real API key and the live Reed API behave as expected:
+import pytest
 
-    python scripts/smoke_test_reed.py
-"""
-from __future__ import annotations
-
-from config import get_settings
-from sources.reed import ReedSource
+from sources.ats_watchlist import AtsTarget, AtsWatchlistError, load_ats_watchlist
 
 
-def main() -> None:
-    settings = get_settings()
-    if not settings.sources.reed_enabled:
-        print("REED_API_KEY is not set in .env - nothing to test.")
-        return
+class TestLoadAtsWatchlist:
+    def test_loads_valid_watchlist(self, tmp_path) -> None:
+        path = tmp_path / "watchlist.json"
+        path.write_text(
+            json.dumps(
+                {
+                    "greenhouse": [{"slug": "acme", "company_name": "Acme Corp"}],
+                    "lever": [],
+                    "ashby": [{"slug": "beta", "company_name": "Beta Inc"}],
+                }
+            )
+        )
+        result = load_ats_watchlist(path)
 
-    source = ReedSource(api_key=settings.sources.reed_api_key)
-    jobs = source.fetch_jobs(search_terms=("paid media manager",), countries=())
+        assert result["greenhouse"] == (AtsTarget(slug="acme", company_name="Acme Corp"),)
+        assert result["lever"] == ()
+        assert result["ashby"] == (AtsTarget(slug="beta", company_name="Beta Inc"),)
 
-    print(f"Fetched {len(jobs)} job(s) from Reed.\n")
-    for job in jobs[:5]:
-        print(f"- {job.job_title} @ {job.company} ({job.location}) -> {job.job_url}")
+    def test_missing_platform_key_returns_empty_tuple(self, tmp_path) -> None:
+        path = tmp_path / "watchlist.json"
+        path.write_text(json.dumps({"greenhouse": [{"slug": "acme", "company_name": "Acme Corp"}]}))
 
+        result = load_ats_watchlist(path)
 
-if __name__ == "__main__":
-    main()
+        assert result["lever"] == ()
+        assert result["ashby"] == ()
+
+    def test_ignores_underscore_metadata_key(self, tmp_path) -> None:
+        path = tmp_path / "watchlist.json"
+        path.write_text(json.dumps({"_comment": "instructions", "greenhouse": [], "lever": [], "ashby": []}))
+
+        result = load_ats_watchlist(path)
+
+        assert result["greenhouse"] == ()
+
+    def test_missing_file_raises(self, tmp_path) -> None:
+        with pytest.raises(AtsWatchlistError, match="Could not read"):
+            load_ats_watchlist(tmp_path / "does_not_exist.json")
+
+    def test_invalid_json_raises(self, tmp_path) -> None:
+        path = tmp_path / "watchlist.json"
+        path.write_text("{not valid json")
+        with pytest.raises(AtsWatchlistError, match="not valid JSON"):
+            load_ats_watchlist(path)
+
+    def test_entry_missing_slug_raises(self, tmp_path) -> None:
+        path = tmp_path / "watchlist.json"
+        path.write_text(json.dumps({"greenhouse": [{"company_name": "Acme Corp"}]}))
+        with pytest.raises(AtsWatchlistError, match="slug"):
+            load_ats_watchlist(path)
+
+    def test_entry_missing_company_name_raises(self, tmp_path) -> None:
+        path = tmp_path / "watchlist.json"
+        path.write_text(json.dumps({"greenhouse": [{"slug": "acme"}]}))
+        with pytest.raises(AtsWatchlistError, match="company_name"):
+            load_ats_watchlist(path)
+
+    def test_platform_value_not_a_list_raises(self, tmp_path) -> None:
+        path = tmp_path / "watchlist.json"
+        path.write_text(json.dumps({"greenhouse": "not-a-list"}))
+        with pytest.raises(AtsWatchlistError, match="must be a list"):
+            load_ats_watchlist(path)
+
+    def test_real_project_watchlist_file_loads_successfully(self) -> None:
+        # Guards against the shipped config/ats_watchlist.json ever
+        # becoming invalid without a test catching it.
+        from pathlib import Path
+
+        real_path = Path(__file__).parent.parent / "config" / "ats_watchlist.json"
+        result = load_ats_watchlist(real_path)
+        assert set(result.keys()) == {"greenhouse", "lever", "ashby"}

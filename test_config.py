@@ -1,194 +1,237 @@
-"""
-SQLite storage layer.
+"""Unit tests for storage/google_sheet.py. Uses an injected mock
+gspread.Client - no real Google API calls or credentials needed."""
+from datetime import date
+from unittest.mock import MagicMock
 
-Owns three tables:
-    companies  - the watchlist, populated as a byproduct of discovery
-    jobs_seen  - append-only dedup ledger; every job ever encountered,
-                 matched or not, keyed by Job.dedup_hash()
-    leads      - qualified, scored jobs that passed the filter and
-                 threshold; this is what gets exported to Sheets
+import gspread
+import pytest
 
-The dedup guarantee lives here: insert_lead() and mark_seen() both use
-INSERT OR IGNORE against a UNIQUE constraint on the hash, so a job seen
-on day 1 can never be written twice, even across process restarts.
-"""
-from __future__ import annotations
-
-import sqlite3
-from contextlib import contextmanager
-from datetime import date, datetime, timezone
-from pathlib import Path
-from typing import Iterator
-
-from models.company import Company
 from models.job import Job
-
-_SCHEMA = """
-CREATE TABLE IF NOT EXISTS companies (
-    id INTEGER PRIMARY KEY AUTOINCREMENT,
-    name TEXT NOT NULL UNIQUE,
-    discovered_via TEXT NOT NULL,
-    discovered_at TEXT NOT NULL,
-    greenhouse_slug TEXT,
-    lever_slug TEXT,
-    ashby_slug TEXT,
-    active INTEGER NOT NULL DEFAULT 1
-);
-
-CREATE TABLE IF NOT EXISTS jobs_seen (
-    job_hash TEXT PRIMARY KEY,
-    company TEXT NOT NULL,
-    job_title TEXT NOT NULL,
-    source TEXT NOT NULL,
-    first_seen_at TEXT NOT NULL
-);
-
-CREATE TABLE IF NOT EXISTS leads (
-    id INTEGER PRIMARY KEY AUTOINCREMENT,
-    job_hash TEXT NOT NULL UNIQUE REFERENCES jobs_seen(job_hash),
-    score INTEGER NOT NULL,
-    company TEXT NOT NULL,
-    job_title TEXT NOT NULL,
-    location TEXT NOT NULL,
-    country TEXT NOT NULL,
-    source TEXT NOT NULL,
-    job_url TEXT NOT NULL,
-    posted_date TEXT,
-    found_at TEXT NOT NULL,
-    status TEXT NOT NULL DEFAULT 'New',
-    exported_at TEXT
-);
-"""
+from storage.database import Database
+from storage.google_sheet import GoogleSheetError, GoogleSheetExporter
 
 
-class Database:
-    """Thin wrapper around a SQLite connection for the Lead Discovery Engine.
+def _job(**overrides: object) -> Job:
+    defaults: dict[str, object] = dict(
+        company="Acme Real Estate",
+        job_title="Paid Media Manager",
+        location="Doha, Qatar",
+        country="Qatar",
+        source="jooble",
+        job_url="https://example.com/jobs/1",
+        posted_date=date(2026, 7, 1),
+        description="desc",
+    )
+    defaults.update(overrides)
+    return Job(**defaults)  # type: ignore[arg-type]
 
-    Usage:
-        db = Database(Path("./data/lead_discovery.db"))
-        db.initialize_schema()
-        ...
-        db.close()
 
-    Or as a context manager:
-        with Database(path) as db:
-            db.initialize_schema()
-    """
+@pytest.fixture
+def database() -> Database:
+    db = Database(":memory:")
+    db.initialize_schema()
+    job = _job()
+    db.mark_seen(job)
+    db.insert_lead(job, score=100)
+    yield db
+    db.close()
 
-    def __init__(self, database_path: Path | str) -> None:
-        self._path = str(database_path)
-        if self._path != ":memory:":
-            Path(self._path).parent.mkdir(parents=True, exist_ok=True)
-        self._conn = sqlite3.connect(self._path)
-        self._conn.row_factory = sqlite3.Row
-        self._conn.execute("PRAGMA foreign_keys = ON")
 
-    def initialize_schema(self) -> None:
-        """Create tables if they don't already exist. Safe to call every run."""
-        self._conn.executescript(_SCHEMA)
-        self._conn.commit()
+def _mock_client_with_worksheet(header_present: bool = True) -> tuple[MagicMock, MagicMock]:
+    """Build a mock gspread client whose open_by_key().worksheet()
+    chain returns a controllable mock worksheet."""
+    worksheet = MagicMock()
+    worksheet.row_values.return_value = ["Score", "Company"] if header_present else []
 
-    # --- jobs_seen (dedup ledger) -------------------------------------
+    spreadsheet = MagicMock()
+    spreadsheet.worksheet.return_value = worksheet
 
-    def has_seen(self, job_hash: str) -> bool:
-        """Return True if this job hash has already been recorded."""
-        cursor = self._conn.execute(
-            "SELECT 1 FROM jobs_seen WHERE job_hash = ? LIMIT 1", (job_hash,)
+    client = MagicMock()
+    client.open_by_key.return_value = spreadsheet
+    return client, worksheet
+
+
+class TestGoogleSheetExporterConstruction:
+    def test_requires_sheet_id(self) -> None:
+        with pytest.raises(ValueError, match="sheet_id"):
+            GoogleSheetExporter(sheet_id="", client=MagicMock())
+
+    def test_requires_service_account_file_when_no_client_injected(self) -> None:
+        with pytest.raises(ValueError, match="service_account_file"):
+            GoogleSheetExporter(sheet_id="abc123")
+
+
+class TestExportLeads:
+    def test_exports_leads_and_returns_hashes(self, database: Database) -> None:
+        client, worksheet = _mock_client_with_worksheet()
+        exporter = GoogleSheetExporter(sheet_id="abc123", client=client)
+
+        leads = database.get_unexported_leads()
+        exported_hashes = exporter.export_leads(leads)
+
+        assert len(exported_hashes) == 1
+        assert exported_hashes[0] == leads[0]["job_hash"]
+        worksheet.append_rows.assert_called_once()
+
+    def test_row_column_order_matches_spec(self, database: Database) -> None:
+        client, worksheet = _mock_client_with_worksheet()
+        exporter = GoogleSheetExporter(sheet_id="abc123", client=client)
+
+        leads = database.get_unexported_leads()
+        exporter.export_leads(leads)
+
+        appended_rows = worksheet.append_rows.call_args[0][0]
+        row = appended_rows[0]
+        # Score, Company, Job Title, Location, Country, Source, Job URL, Date Found, Status
+        assert row[0] == 100
+        assert row[1] == "Acme Real Estate"
+        assert row[2] == "Paid Media Manager"
+        assert row[3] == "Doha, Qatar"
+        assert row[4] == "Qatar"
+        assert row[5] == "jooble"
+        assert row[6] == "https://example.com/jobs/1"
+        assert row[8] == "New"
+
+    def test_empty_leads_list_does_not_call_api(self) -> None:
+        client, worksheet = _mock_client_with_worksheet()
+        exporter = GoogleSheetExporter(sheet_id="abc123", client=client)
+
+        result = exporter.export_leads([])
+
+        assert result == []
+        client.open_by_key.assert_not_called()
+
+    def test_writes_header_when_worksheet_is_empty(self, database: Database) -> None:
+        client, worksheet = _mock_client_with_worksheet(header_present=False)
+        exporter = GoogleSheetExporter(sheet_id="abc123", client=client)
+
+        exporter.export_leads(database.get_unexported_leads())
+
+        header_call = worksheet.append_row.call_args[0][0]
+        assert header_call == [
+            "Score", "Company", "Job Title", "Location", "Country",
+            "Source", "Job URL", "Date Found", "Status",
+        ]
+
+    def test_does_not_rewrite_header_when_already_present(self, database: Database) -> None:
+        client, worksheet = _mock_client_with_worksheet(header_present=True)
+        exporter = GoogleSheetExporter(sheet_id="abc123", client=client)
+
+        exporter.export_leads(database.get_unexported_leads())
+
+        worksheet.append_row.assert_not_called()
+
+    def test_creates_worksheet_when_missing(self, database: Database) -> None:
+        new_worksheet = MagicMock()
+        spreadsheet = MagicMock()
+        spreadsheet.worksheet.side_effect = gspread.exceptions.WorksheetNotFound("Leads")
+        spreadsheet.add_worksheet.return_value = new_worksheet
+
+        client = MagicMock()
+        client.open_by_key.return_value = spreadsheet
+
+        exporter = GoogleSheetExporter(sheet_id="abc123", client=client)
+        exporter.export_leads(database.get_unexported_leads())
+
+        spreadsheet.add_worksheet.assert_called_once()
+        new_worksheet.append_row.assert_called_once()  # header written on creation
+        new_worksheet.append_rows.assert_called_once()  # leads appended
+
+    def test_worksheet_is_cached_across_calls(self, database: Database) -> None:
+        client, worksheet = _mock_client_with_worksheet()
+        exporter = GoogleSheetExporter(sheet_id="abc123", client=client)
+
+        exporter.export_leads(database.get_unexported_leads())
+        exporter.export_leads([])  # second call, empty - shouldn't reopen
+
+        assert client.open_by_key.call_count == 1
+
+
+class TestErrorHandling:
+    def test_open_by_key_failure_raises_google_sheet_error(self, database: Database) -> None:
+        client = MagicMock()
+        client.open_by_key.side_effect = gspread.exceptions.APIError(
+            MagicMock(json=lambda: {"error": {"code": 404, "message": "not found", "status": "NOT_FOUND"}})
         )
-        return cursor.fetchone() is not None
+        exporter = GoogleSheetExporter(sheet_id="abc123", client=client)
 
-    def mark_seen(self, job: Job) -> bool:
-        """Record a job hash in the dedup ledger.
+        with pytest.raises(GoogleSheetError, match="Could not open"):
+            exporter.export_leads(database.get_unexported_leads())
 
-        Returns True if this was a new record, False if it already
-        existed (i.e. this call was a no-op duplicate).
-        """
-        cursor = self._conn.execute(
-            """
-            INSERT OR IGNORE INTO jobs_seen (job_hash, company, job_title, source, first_seen_at)
-            VALUES (?, ?, ?, ?, ?)
-            """,
-            (job.dedup_hash(), job.company, job.job_title, job.source, datetime.now(timezone.utc).isoformat()),
+    def test_append_rows_failure_raises_google_sheet_error(self, database: Database) -> None:
+        client, worksheet = _mock_client_with_worksheet()
+        worksheet.append_rows.side_effect = gspread.exceptions.APIError(
+            MagicMock(json=lambda: {"error": {"code": 429, "message": "quota exceeded", "status": "RESOURCE_EXHAUSTED"}})
         )
-        self._conn.commit()
-        return cursor.rowcount > 0
+        exporter = GoogleSheetExporter(sheet_id="abc123", client=client)
 
-    # --- leads ----------------------------------------------------------
+        with pytest.raises(GoogleSheetError, match="Failed to append"):
+            exporter.export_leads(database.get_unexported_leads())
 
-    def insert_lead(self, job: Job, score: int) -> bool:
-        """Insert a qualified, scored job into the leads table.
-
-        Returns True if inserted, False if a lead with this job_hash
-        already existed (duplicate-safe by construction).
-        """
-        cursor = self._conn.execute(
-            """
-            INSERT OR IGNORE INTO leads (
-                job_hash, score, company, job_title, location, country,
-                source, job_url, posted_date, found_at, status
-            ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, 'New')
-            """,
-            (
-                job.dedup_hash(),
-                score,
-                job.company,
-                job.job_title,
-                job.location,
-                job.country,
-                job.source,
-                job.job_url,
-                job.posted_date.isoformat() if job.posted_date else None,
-                datetime.now(timezone.utc).isoformat(),
-            ),
+    def test_leads_stay_unexported_in_db_after_export_failure(self, database: Database) -> None:
+        client, worksheet = _mock_client_with_worksheet()
+        worksheet.append_rows.side_effect = gspread.exceptions.APIError(
+            MagicMock(json=lambda: {"error": {"code": 429, "message": "quota exceeded", "status": "RESOURCE_EXHAUSTED"}})
         )
-        self._conn.commit()
-        return cursor.rowcount > 0
+        exporter = GoogleSheetExporter(sheet_id="abc123", client=client)
 
-    def get_unexported_leads(self) -> list[sqlite3.Row]:
-        """Return all leads that haven't been exported to Google Sheets yet."""
-        cursor = self._conn.execute(
-            "SELECT * FROM leads WHERE exported_at IS NULL ORDER BY score DESC"
-        )
-        return cursor.fetchall()
+        leads = database.get_unexported_leads()
+        with pytest.raises(GoogleSheetError):
+            exporter.export_leads(leads)
 
-    def mark_exported(self, job_hashes: list[str]) -> None:
-        """Stamp exported_at on the given leads after a successful Sheets write."""
-        if not job_hashes:
-            return
-        now = datetime.now(timezone.utc).isoformat()
-        self._conn.executemany(
-            "UPDATE leads SET exported_at = ? WHERE job_hash = ?",
-            [(now, job_hash) for job_hash in job_hashes],
-        )
-        self._conn.commit()
+        # Caller (main.py) only calls mark_exported with the returned
+        # hashes - since export_leads raised, none were returned, so
+        # the lead must still show up as unexported.
+        assert len(database.get_unexported_leads()) == 1
 
-    # --- companies --------------------------------------------------------
+    def test_non_gspread_exception_during_open_is_still_wrapped(self, database: Database) -> None:
+        # Regression test: google.auth.exceptions.RefreshError (raised
+        # during OAuth token refresh, e.g. on network failure) is NOT a
+        # gspread.exceptions.APIError. A narrower except clause here
+        # let this propagate uncaught and crash the whole run in
+        # practice - this must never happen for an export failure.
+        client = MagicMock()
+        client.open_by_key.side_effect = RuntimeError("Host not in allowlist: oauth2.googleapis.com")
+        exporter = GoogleSheetExporter(sheet_id="abc123", client=client)
 
-    def upsert_company(self, company: Company) -> None:
-        """Insert a newly discovered company, or leave an existing one
-        untouched (first discovery wins; slugs are updated separately
-        once confirmed in a later milestone)."""
-        self._conn.execute(
-            """
-            INSERT INTO companies (name, discovered_via, discovered_at, active)
-            VALUES (?, ?, ?, 1)
-            ON CONFLICT(name) DO NOTHING
-            """,
-            (company.name, company.discovered_via, company.discovered_at.isoformat()),
-        )
-        self._conn.commit()
+        with pytest.raises(GoogleSheetError, match="Could not open"):
+            exporter.export_leads(database.get_unexported_leads())
 
-    def get_company(self, name: str) -> sqlite3.Row | None:
-        cursor = self._conn.execute("SELECT * FROM companies WHERE name = ?", (name,))
-        return cursor.fetchone()
+    def test_non_gspread_exception_during_append_is_still_wrapped(self, database: Database) -> None:
+        client, worksheet = _mock_client_with_worksheet()
+        worksheet.append_rows.side_effect = ConnectionError("network unreachable")
+        exporter = GoogleSheetExporter(sheet_id="abc123", client=client)
 
-    # --- lifecycle ----------------------------------------------------------
+        with pytest.raises(GoogleSheetError, match="Failed to append"):
+            exporter.export_leads(database.get_unexported_leads())
 
-    def close(self) -> None:
-        self._conn.close()
+    def test_exception_with_empty_str_still_produces_useful_message(self, database: Database) -> None:
+        # Regression test: production logs showed "Could not open Google
+        # Sheet '***': " with nothing after the colon - str(exc) was
+        # empty. The error message must always carry the exception type
+        # name at minimum, even when str(exc) gives nothing.
+        class BlankException(Exception):
+            def __str__(self) -> str:
+                return ""
 
-    def __enter__(self) -> "Database":
-        return self
+        client = MagicMock()
+        client.open_by_key.side_effect = BlankException()
+        exporter = GoogleSheetExporter(sheet_id="abc123", client=client)
 
-    def __exit__(self, *exc_info: object) -> None:
-        self.close()
+        with pytest.raises(GoogleSheetError, match="BlankException") as exc_info:
+            exporter.export_leads(database.get_unexported_leads())
+        assert str(exc_info.value).strip() != "Could not open Google Sheet (id redacted if secret):"
+
+
+class TestDateFormatting:
+    def test_date_found_extracts_date_portion_from_iso_timestamp(self, database: Database) -> None:
+        client, worksheet = _mock_client_with_worksheet()
+        exporter = GoogleSheetExporter(sheet_id="abc123", client=client)
+
+        leads = database.get_unexported_leads()
+        exporter.export_leads(leads)
+
+        row = worksheet.append_rows.call_args[0][0][0]
+        date_found = row[7]
+        assert len(date_found) == 10  # YYYY-MM-DD, no time component
+        assert "T" not in date_found

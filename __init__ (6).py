@@ -1,104 +1,134 @@
-"""
-Lever connector.
+"""Unit tests for config.py - fail-fast validation behaviour."""
+import pytest
 
-Implements JobSource against Lever's public Postings API:
-    GET https://api.lever.co/v0/postings/{company}?mode=json
-    response: a plain JSON array (not wrapped in an object) of
-    postings: [{"id", "text", "hostedUrl", "applyUrl",
-                "categories": {"team", "location", "commitment"},
-                "createdAt" (epoch ms), "descriptionPlain",
-                "workplaceType"}, ...]
-No authentication required for read access.
-
-Like Greenhouse, this fetches every open posting for a known company
-slug rather than searching by keyword. search_terms/countries are
-ignored; companies come from the ATS watchlist.
-
-Reference: https://github.com/lever/postings-api
-"""
-from __future__ import annotations
-
-from datetime import date, datetime, timezone
-
-import requests
-
-from models.job import Job
-from sources.ats_watchlist import AtsTarget
-from sources.base import JobSource
-from sources.http_utils import fetch_json_with_retry
-from utils.logger import get_logger
-
-logger = get_logger(__name__)
-
-_URL_TEMPLATE = "https://api.lever.co/v0/postings/{company}?mode=json"
-_TIMEOUT_SECONDS = 10
+from config import ConfigError, _load_settings
 
 
-class LeverSource(JobSource):
-    """ATS-direct source backed by Lever's public Postings API."""
+def _write_env(tmp_path, overrides=None):
+    base = {
+        "JOOBLE_API_KEY": "test-key",
+        "ADZUNA_APP_ID": "",
+        "ADZUNA_APP_KEY": "",
+        "SEARCH_TERMS": "paid media,media buyer",
+        "SEARCH_COUNTRIES": "gb,us",
+        "TITLE_SCORES_FILE": str(tmp_path / "title_scores.json"),
+        "FUZZY_MATCH_THRESHOLD": "82",
+        "ATS_WATCHLIST_FILE": "",
+        "MIN_SCORE": "50",
+        "DATABASE_PATH": "./data/test.db",
+        "GOOGLE_SHEET_ID": "",
+        "GOOGLE_SERVICE_ACCOUNT_FILE": "./credentials/sa.json",
+        "LOG_LEVEL": "INFO",
+        "LOG_FILE": "./logs/test.log",
+    }
+    if overrides:
+        base.update(overrides)
+    env_path = tmp_path / ".env"
+    env_path.write_text("\n".join(f"{k}={v}" for k, v in base.items()))
 
-    name = "lever"
+    title_scores_path = tmp_path / "title_scores.json"
+    if not title_scores_path.exists():
+        title_scores_path.write_text('{"Paid Media Manager": 100}')
 
-    def __init__(self, targets: tuple[AtsTarget, ...], session: requests.Session | None = None) -> None:
-        if not targets:
-            raise ValueError("LeverSource requires at least one watchlist target")
-        self._targets = targets
-        self._session = session or requests.Session()
+    return env_path
 
-    def fetch_jobs(self, search_terms: tuple[str, ...], countries: tuple[str, ...]) -> list[Job]:
-        """Fetch every open posting for each watchlisted company. Ignores
-        search_terms/countries - relevance filtering happens downstream
-        in core/job_filter.py."""
-        jobs: list[Job] = []
-        for target in self._targets:
-            raw_postings = self._fetch_postings(target.slug)
-            for raw_posting in raw_postings:
-                job = self._normalize(raw_posting, target.company_name)
-                if job is not None:
-                    jobs.append(job)
-        return jobs
 
-    def _fetch_postings(self, company_slug: str) -> list[dict]:
-        url = _URL_TEMPLATE.format(company=company_slug)
-        data = fetch_json_with_retry(
-            self._session, "GET", url, source_name="Lever", timeout=_TIMEOUT_SECONDS
-        )
-        # Lever returns a bare array, unlike Jooble/Greenhouse/Ashby's
-        # object-wrapped responses.
-        return data if isinstance(data, list) else []
+def test_valid_config_loads(tmp_path):
+    env_path = _write_env(tmp_path)
+    settings = _load_settings(str(env_path))
+    assert settings.sources.jooble_enabled is True
+    assert settings.sources.adzuna_enabled is False
+    assert settings.min_score == 50
+    assert settings.search_terms == ("paid media", "media buyer")
 
-    def _normalize(self, raw_posting: dict, company_name: str) -> Job | None:
-        try:
-            title = (raw_posting.get("text") or "").strip()
-            job_url = (raw_posting.get("hostedUrl") or raw_posting.get("applyUrl") or "").strip()
-            if not title or not job_url:
-                logger.warning("Skipping Lever posting missing required fields: %r", raw_posting)
-                return None
 
-            categories = raw_posting.get("categories") or {}
-            location = (categories.get("location") or "").strip()
+def test_no_discovery_source_configured_raises(tmp_path, monkeypatch):
+    monkeypatch.delenv("JOOBLE_API_KEY", raising=False)
+    monkeypatch.delenv("ADZUNA_APP_ID", raising=False)
+    monkeypatch.delenv("ADZUNA_APP_KEY", raising=False)
+    env_path = _write_env(tmp_path, {"JOOBLE_API_KEY": ""})
+    with pytest.raises(ConfigError, match="No discovery source"):
+        _load_settings(str(env_path))
 
-            return Job(
-                company=company_name,
-                job_title=title,
-                location=location,
-                country="Unknown",
-                source=self.name,
-                job_url=job_url,
-                posted_date=self._parse_created_at(raw_posting.get("createdAt")),
-                description=(raw_posting.get("descriptionPlain") or "").strip(),
-            )
-        except Exception as exc:  # defensive: one bad record shouldn't break the batch
-            logger.warning("Failed to normalize Lever posting %r: %s", raw_posting, exc)
-            return None
 
-    @staticmethod
-    def _parse_created_at(raw_value: object) -> date | None:
-        """Lever's createdAt is a millisecond epoch timestamp (int)."""
-        if raw_value is None:
-            return None
-        try:
-            return datetime.fromtimestamp(int(raw_value) / 1000, tz=timezone.utc).date()
-        except (TypeError, ValueError, OverflowError):
-            logger.warning("Could not parse Lever createdAt value: %r", raw_value)
-            return None
+def test_missing_search_terms_raises(tmp_path, monkeypatch):
+    monkeypatch.delenv("SEARCH_TERMS", raising=False)
+    env_path = _write_env(tmp_path, {"SEARCH_TERMS": ""})
+    with pytest.raises(ConfigError, match="SEARCH_TERMS"):
+        _load_settings(str(env_path))
+
+
+def test_invalid_min_score_raises(tmp_path, monkeypatch):
+    monkeypatch.delenv("MIN_SCORE", raising=False)
+    env_path = _write_env(tmp_path, {"MIN_SCORE": "not-a-number"})
+    with pytest.raises(ConfigError, match="MIN_SCORE"):
+        _load_settings(str(env_path))
+
+
+def test_malformed_sheet_id_raises(tmp_path, monkeypatch):
+    monkeypatch.delenv("GOOGLE_SHEET_ID", raising=False)
+    env_path = _write_env(
+        tmp_path, {"GOOGLE_SHEET_ID": "https://docs.google.com/spreadsheets/d/abc123"}
+    )
+    with pytest.raises(ConfigError, match="GOOGLE_SHEET_ID"):
+        _load_settings(str(env_path))
+
+
+def test_missing_title_scores_file_raises(tmp_path, monkeypatch):
+    monkeypatch.delenv("TITLE_SCORES_FILE", raising=False)
+    env_path = _write_env(
+        tmp_path, {"TITLE_SCORES_FILE": str(tmp_path / "does_not_exist.json")}
+    )
+    with pytest.raises(ConfigError, match="TITLE_SCORES_FILE"):
+        _load_settings(str(env_path))
+
+
+def test_fuzzy_threshold_out_of_range_raises(tmp_path, monkeypatch):
+    monkeypatch.delenv("FUZZY_MATCH_THRESHOLD", raising=False)
+    env_path = _write_env(tmp_path, {"FUZZY_MATCH_THRESHOLD": "150"})
+    with pytest.raises(ConfigError, match="FUZZY_MATCH_THRESHOLD"):
+        _load_settings(str(env_path))
+
+
+def test_fuzzy_threshold_not_integer_raises(tmp_path, monkeypatch):
+    monkeypatch.delenv("FUZZY_MATCH_THRESHOLD", raising=False)
+    env_path = _write_env(tmp_path, {"FUZZY_MATCH_THRESHOLD": "high"})
+    with pytest.raises(ConfigError, match="FUZZY_MATCH_THRESHOLD"):
+        _load_settings(str(env_path))
+
+
+def test_missing_service_account_file_raises_when_sheet_id_set(tmp_path, monkeypatch):
+    monkeypatch.delenv("GOOGLE_SHEET_ID", raising=False)
+    monkeypatch.delenv("GOOGLE_SERVICE_ACCOUNT_FILE", raising=False)
+    env_path = _write_env(
+        tmp_path,
+        {
+            "GOOGLE_SHEET_ID": "abc123def456",
+            "GOOGLE_SERVICE_ACCOUNT_FILE": str(tmp_path / "does_not_exist.json"),
+        },
+    )
+    with pytest.raises(ConfigError, match="GOOGLE_SERVICE_ACCOUNT_FILE"):
+        _load_settings(str(env_path))
+
+
+def test_missing_ats_watchlist_file_raises_when_set(tmp_path, monkeypatch):
+    monkeypatch.delenv("ATS_WATCHLIST_FILE", raising=False)
+    env_path = _write_env(
+        tmp_path, {"ATS_WATCHLIST_FILE": str(tmp_path / "does_not_exist.json")}
+    )
+    with pytest.raises(ConfigError, match="ATS_WATCHLIST_FILE"):
+        _load_settings(str(env_path))
+
+
+def test_blank_ats_watchlist_file_is_valid(tmp_path, monkeypatch):
+    monkeypatch.delenv("ATS_WATCHLIST_FILE", raising=False)
+    env_path = _write_env(tmp_path, {"ATS_WATCHLIST_FILE": ""})
+    settings = _load_settings(str(env_path))
+    assert settings.ats_watchlist_file is None
+
+
+def test_invalid_log_level_raises(tmp_path, monkeypatch):
+    monkeypatch.delenv("LOG_LEVEL", raising=False)
+    env_path = _write_env(tmp_path, {"LOG_LEVEL": "VERBOSE"})
+    with pytest.raises(ConfigError, match="LOG_LEVEL"):
+        _load_settings(str(env_path))

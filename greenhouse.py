@@ -1,122 +1,84 @@
-"""
-Pipeline orchestrator.
+"""Unit tests for core/scoring.py."""
+import json
 
-Runs the full daily sequence: fetch jobs from every configured source,
-dedupe, filter by title, score, and persist qualified leads. One
-failing source is logged and skipped rather than aborting the whole
-run - this matters because this runs unattended, once a day, and a
-single flaky API shouldn't block leads from every other source.
+import pytest
 
-Google Sheets export is intentionally NOT called here yet (Milestone 6);
-this orchestrator's job ends at persisting leads to SQLite.
-"""
-from __future__ import annotations
-
-from datetime import datetime, timezone
-
-from core.deduplicator import Deduplicator
-from core.job_filter import JobFilter
-from core.scoring import ScoringEngine
-from exceptions import SourceError
-from models.company import Company
-from models.job import Job
-from models.run_stats import RunStats
-from sources.base import JobSource
-from storage.database import Database
-from utils.logger import get_logger
-
-logger = get_logger(__name__)
+from core.scoring import ScoringConfigError, ScoringEngine
 
 
-class Orchestrator:
-    """Coordinates a single end-to-end pipeline run across all sources."""
+class TestScoringEngineFromDict:
+    def test_score_returns_configured_value(self) -> None:
+        engine = ScoringEngine({"Paid Media Manager": 100, "Campaign Manager": 70})
+        assert engine.score("Paid Media Manager") == 100
+        assert engine.score("Campaign Manager") == 70
 
-    def __init__(
-        self,
-        sources: list[JobSource],
-        database: Database,
-        job_filter: JobFilter,
-        scoring_engine: ScoringEngine,
-        search_terms: tuple[str, ...],
-        search_countries: tuple[str, ...],
-        min_score: int,
-    ) -> None:
-        self._sources = sources
-        self._database = database
-        self._job_filter = job_filter
-        self._scoring_engine = scoring_engine
-        self._search_terms = search_terms
-        self._search_countries = search_countries
-        self._min_score = min_score
-        self._deduplicator = Deduplicator(database)
+    def test_score_unrecognized_title_returns_zero(self) -> None:
+        engine = ScoringEngine({"Paid Media Manager": 100})
+        assert engine.score("Nonexistent Title") == 0
 
-    def run(self) -> RunStats:
-        """Execute one full pipeline run and return the accumulated stats."""
-        stats = RunStats()
-        logger.info("Pipeline run starting: %d source(s) configured", len(self._sources))
+    def test_canonical_titles_returns_all_keys(self) -> None:
+        engine = ScoringEngine({"Paid Media Manager": 100, "Campaign Manager": 70})
+        assert set(engine.canonical_titles) == {"Paid Media Manager", "Campaign Manager"}
 
-        for source in self._sources:
-            self._run_source(source, stats)
+    def test_meets_threshold_true_when_score_at_or_above_min(self) -> None:
+        engine = ScoringEngine({"X": 50})
+        assert engine.meets_threshold(score=50, min_score=50) is True
+        assert engine.meets_threshold(score=60, min_score=50) is True
 
-        stats.finish()
-        logger.info(stats.summary())
-        if stats.errors:
-            for error in stats.errors:
-                logger.error("Run error: %s", error)
+    def test_meets_threshold_false_when_score_below_min(self) -> None:
+        engine = ScoringEngine({"X": 50})
+        assert engine.meets_threshold(score=49, min_score=50) is False
 
-        return stats
 
-    def _run_source(self, source: JobSource, stats: RunStats) -> None:
-        """Fetch and process all jobs from a single source. Any failure
-        here is recorded in stats and does not propagate - the run
-        continues with the next source."""
-        try:
-            jobs = source.fetch_jobs(
-                search_terms=self._search_terms, countries=self._search_countries
-            )
-        except SourceError as exc:
-            message = f"{source.name}: {exc}"
-            logger.error("Source failed, skipping: %s", message)
-            stats.record_error(message)
-            return
-        except Exception as exc:  # noqa: BLE001 - defensive: a connector
-            # bug shouldn't be able to take down the whole daily run.
-            message = f"{source.name}: unexpected error: {exc}"
-            logger.exception("Source raised an unexpected exception, skipping: %s", source.name)
-            stats.record_error(message)
-            return
+class TestScoringEngineFromFile:
+    def test_loads_valid_file(self, tmp_path) -> None:
+        path = tmp_path / "title_scores.json"
+        path.write_text(json.dumps({"Paid Media Manager": 100, "Campaign Manager": 70}))
+        engine = ScoringEngine.from_file(path)
+        assert engine.score("Paid Media Manager") == 100
 
-        logger.info("Fetched %d job(s) from %s", len(jobs), source.name)
+    def test_ignores_underscore_prefixed_metadata_keys(self, tmp_path) -> None:
+        path = tmp_path / "title_scores.json"
+        path.write_text(json.dumps({"_comment": "some note", "Paid Media Manager": 100}))
+        engine = ScoringEngine.from_file(path)
+        assert "_comment" not in engine.canonical_titles
+        assert engine.score("Paid Media Manager") == 100
 
-        for job in jobs:
-            stats.jobs_checked += 1
-            self._process_job(job, stats)
+    def test_missing_file_raises_scoring_config_error(self, tmp_path) -> None:
+        path = tmp_path / "does_not_exist.json"
+        with pytest.raises(ScoringConfigError, match="Could not read"):
+            ScoringEngine.from_file(path)
 
-    def _process_job(self, job: Job, stats: RunStats) -> None:
-        """Run a single job through dedupe -> filter -> score -> persist."""
-        if not self._deduplicator.is_new(job):
-            stats.jobs_duplicate += 1
-            return
+    def test_invalid_json_raises_scoring_config_error(self, tmp_path) -> None:
+        path = tmp_path / "title_scores.json"
+        path.write_text("{not valid json")
+        with pytest.raises(ScoringConfigError, match="not valid JSON"):
+            ScoringEngine.from_file(path)
 
-        matched_title = self._job_filter.match(job.job_title)
-        if matched_title is None:
-            stats.jobs_ignored += 1
-            return
+    def test_non_integer_score_raises_scoring_config_error(self, tmp_path) -> None:
+        path = tmp_path / "title_scores.json"
+        path.write_text(json.dumps({"Paid Media Manager": "high"}))
+        with pytest.raises(ScoringConfigError, match="must be an integer"):
+            ScoringEngine.from_file(path)
 
-        score = self._scoring_engine.score(matched_title)
-        if not self._scoring_engine.meets_threshold(score, self._min_score):
-            stats.jobs_ignored += 1
-            return
+    def test_out_of_range_score_raises_scoring_config_error(self, tmp_path) -> None:
+        path = tmp_path / "title_scores.json"
+        path.write_text(json.dumps({"Paid Media Manager": 150}))
+        with pytest.raises(ScoringConfigError, match="between 0 and 100"):
+            ScoringEngine.from_file(path)
 
-        stats.jobs_matched += 1
+    def test_empty_title_map_raises_scoring_config_error(self, tmp_path) -> None:
+        path = tmp_path / "title_scores.json"
+        path.write_text(json.dumps({"_comment": "only metadata, no titles"}))
+        with pytest.raises(ScoringConfigError, match="no scored titles"):
+            ScoringEngine.from_file(path)
 
-        inserted = self._database.insert_lead(job, score)
-        if inserted:
-            stats.jobs_inserted += 1
-            self._database.upsert_company(
-                Company(
-                    name=job.company,
-                    discovered_via=job.source,
-                    discovered_at=datetime.now(timezone.utc),
-                )
-            )
+    def test_real_project_title_scores_file_loads_successfully(self) -> None:
+        # Guards against the actual shipped config/title_scores.json
+        # ever becoming invalid without a test catching it.
+        from pathlib import Path
+
+        real_path = Path(__file__).parent.parent / "config" / "title_scores.json"
+        engine = ScoringEngine.from_file(real_path)
+        assert engine.score("Paid Media Manager") == 100
+        assert len(engine.canonical_titles) >= 10
