@@ -1,104 +1,31 @@
 """
-Lever connector.
+Standalone smoke test for the Jooble connector.
 
-Implements JobSource against Lever's public Postings API:
-    GET https://api.lever.co/v0/postings/{company}?mode=json
-    response: a plain JSON array (not wrapped in an object) of
-    postings: [{"id", "text", "hostedUrl", "applyUrl",
-                "categories": {"team", "location", "commitment"},
-                "createdAt" (epoch ms), "descriptionPlain",
-                "workplaceType"}, ...]
-No authentication required for read access.
+Not part of the automated test suite (no network access there).
+Run this locally, once, to confirm your real API key and the live
+Jooble API behave the way the connector expects:
 
-Like Greenhouse, this fetches every open posting for a known company
-slug rather than searching by keyword. search_terms/countries are
-ignored; companies come from the ATS watchlist.
-
-Reference: https://github.com/lever/postings-api
+    python scripts/smoke_test_jooble.py
 """
 from __future__ import annotations
 
-from datetime import date, datetime, timezone
-
-import requests
-
-from models.job import Job
-from sources.ats_watchlist import AtsTarget
-from sources.base import JobSource
-from sources.http_utils import fetch_json_with_retry
-from utils.logger import get_logger
-
-logger = get_logger(__name__)
-
-_URL_TEMPLATE = "https://api.lever.co/v0/postings/{company}?mode=json"
-_TIMEOUT_SECONDS = 10
+from config import get_settings
+from sources.jooble import JoobleSource
 
 
-class LeverSource(JobSource):
-    """ATS-direct source backed by Lever's public Postings API."""
+def main() -> None:
+    settings = get_settings()
+    if not settings.sources.jooble_enabled:
+        print("JOOBLE_API_KEY is not set in .env - nothing to test.")
+        return
 
-    name = "lever"
+    source = JoobleSource(api_key=settings.sources.jooble_api_key)
+    jobs = source.fetch_jobs(search_terms=("paid media manager",), countries=("gb",))
 
-    def __init__(self, targets: tuple[AtsTarget, ...], session: requests.Session | None = None) -> None:
-        if not targets:
-            raise ValueError("LeverSource requires at least one watchlist target")
-        self._targets = targets
-        self._session = session or requests.Session()
+    print(f"Fetched {len(jobs)} job(s) from Jooble.\n")
+    for job in jobs[:5]:
+        print(f"- {job.job_title} @ {job.company} ({job.location}) -> {job.job_url}")
 
-    def fetch_jobs(self, search_terms: tuple[str, ...], countries: tuple[str, ...]) -> list[Job]:
-        """Fetch every open posting for each watchlisted company. Ignores
-        search_terms/countries - relevance filtering happens downstream
-        in core/job_filter.py."""
-        jobs: list[Job] = []
-        for target in self._targets:
-            raw_postings = self._fetch_postings(target.slug)
-            for raw_posting in raw_postings:
-                job = self._normalize(raw_posting, target.company_name)
-                if job is not None:
-                    jobs.append(job)
-        return jobs
 
-    def _fetch_postings(self, company_slug: str) -> list[dict]:
-        url = _URL_TEMPLATE.format(company=company_slug)
-        data = fetch_json_with_retry(
-            self._session, "GET", url, source_name="Lever", timeout=_TIMEOUT_SECONDS
-        )
-        # Lever returns a bare array, unlike Jooble/Greenhouse/Ashby's
-        # object-wrapped responses.
-        return data if isinstance(data, list) else []
-
-    def _normalize(self, raw_posting: dict, company_name: str) -> Job | None:
-        try:
-            title = (raw_posting.get("text") or "").strip()
-            job_url = (raw_posting.get("hostedUrl") or raw_posting.get("applyUrl") or "").strip()
-            if not title or not job_url:
-                logger.warning("Skipping Lever posting missing required fields: %r", raw_posting)
-                return None
-
-            categories = raw_posting.get("categories") or {}
-            location = (categories.get("location") or "").strip()
-
-            return Job(
-                company=company_name,
-                job_title=title,
-                location=location,
-                country="Unknown",
-                source=self.name,
-                job_url=job_url,
-                posted_date=self._parse_created_at(raw_posting.get("createdAt")),
-                description=(raw_posting.get("descriptionPlain") or "").strip(),
-            )
-        except Exception as exc:  # defensive: one bad record shouldn't break the batch
-            logger.warning("Failed to normalize Lever posting %r: %s", raw_posting, exc)
-            return None
-
-    @staticmethod
-    def _parse_created_at(raw_value: object) -> date | None:
-        """Lever's createdAt is a millisecond epoch timestamp (int)."""
-        if raw_value is None:
-            return None
-        try:
-            return datetime.fromtimestamp(int(raw_value) / 1000, tz=timezone.utc).date()
-        except (TypeError, ValueError, OverflowError):
-            logger.warning("Could not parse Lever createdAt value: %r", raw_value)
-            return None
+if __name__ == "__main__":
+    main()

@@ -1,146 +1,189 @@
-"""
-ActiPlan Lead Discovery Engine - entrypoint.
+"""Unit tests for sources/greenhouse.py, sources/lever.py, sources/ashby.py.
+All HTTP calls are mocked - no live requests to any ATS platform."""
+from datetime import date
+from unittest.mock import MagicMock
 
-Wires configuration, sources, filtering, scoring, and storage into
-the orchestrator and runs one full pipeline pass. Google Sheets export
-is not yet wired in here (Milestone 6) - this run ends at persisting
-qualified leads to SQLite.
+import pytest
+import requests
 
-Run:
-    python main.py
-"""
-from __future__ import annotations
-
-import sys
-
-from config import ConfigError, Settings, get_settings
-from core.job_filter import JobFilter
-from core.scoring import ScoringConfigError, ScoringEngine
-from pipeline.orchestrator import Orchestrator
+from exceptions import SourceError
 from sources.ashby import AshbySource
-from sources.ats_watchlist import AtsWatchlistError, load_ats_watchlist
-from sources.base import JobSource
+from sources.ats_watchlist import AtsTarget
 from sources.greenhouse import GreenhouseSource
-from sources.jooble import JoobleSource
 from sources.lever import LeverSource
-from storage.database import Database
-from storage.google_sheet import GoogleSheetError, GoogleSheetExporter
-from utils.logger import configure_logging, get_logger
+from tests.fixtures.ats_responses import (
+    ASHBY_EMPTY_RESPONSE,
+    ASHBY_VALID_RESPONSE,
+    GREENHOUSE_EMPTY_RESPONSE,
+    GREENHOUSE_VALID_RESPONSE,
+    LEVER_EMPTY_RESPONSE,
+    LEVER_VALID_RESPONSE,
+)
+
+ACME_TARGETS = (AtsTarget(slug="acme", company_name="Acme Corp"),)
 
 
-def _build_sources(settings: Settings) -> list[JobSource]:
-    """Instantiate every configured, enabled discovery and ATS source.
+def _mock_session(json_payload, status_code: int = 200) -> MagicMock:
+    mock_response = MagicMock()
+    mock_response.status_code = status_code
+    mock_response.json.return_value = json_payload
+    if status_code >= 400:
+        mock_response.raise_for_status.side_effect = requests.HTTPError(f"{status_code} error")
+    else:
+        mock_response.raise_for_status.return_value = None
 
-    A source with no credentials/watchlist entries configured is simply
-    omitted here, not an error - config.py already guarantees at least
-    one Tier 1 discovery source is enabled before the app can start;
-    Tier 2 ATS sources are optional on top of that.
-    """
-    sources: list[JobSource] = []
-    if settings.sources.jooble_enabled:
-        sources.append(JoobleSource(api_key=settings.sources.jooble_api_key))
-    # Adzuna connector lands in a later milestone; settings.sources.adzuna_enabled
-    # will be True once ADZUNA_APP_ID/ADZUNA_APP_KEY are approved and set.
-
-    if settings.ats_watchlist_file is not None:
-        try:
-            watchlist = load_ats_watchlist(settings.ats_watchlist_file)
-        except AtsWatchlistError as exc:
-            get_logger(__name__).error("Failed to load ATS watchlist, skipping ATS sources: %s", exc)
-            watchlist = {"greenhouse": (), "lever": (), "ashby": ()}
-
-        if watchlist["greenhouse"]:
-            sources.append(GreenhouseSource(targets=watchlist["greenhouse"]))
-        if watchlist["lever"]:
-            sources.append(LeverSource(targets=watchlist["lever"]))
-        if watchlist["ashby"]:
-            sources.append(AshbySource(targets=watchlist["ashby"]))
-
-    return sources
+    session = MagicMock()
+    session.request.return_value = mock_response
+    return session
 
 
-def _export_leads(settings: Settings, database: Database) -> None:
-    """Export any unexported leads to Google Sheets. Non-fatal: a
-    failure here is logged and the run still exits cleanly - leads
-    stay marked unexported in the DB and are retried next run."""
-    logger = get_logger(__name__)
+class TestGreenhouseSource:
+    def test_requires_at_least_one_target(self) -> None:
+        with pytest.raises(ValueError, match="at least one"):
+            GreenhouseSource(targets=())
 
-    if not settings.google_sheet_id:
-        logger.info("GOOGLE_SHEET_ID not set, skipping Google Sheets export.")
-        return
+    def test_returns_normalized_jobs_and_skips_incomplete(self) -> None:
+        session = _mock_session(GREENHOUSE_VALID_RESPONSE)
+        source = GreenhouseSource(targets=ACME_TARGETS, session=session)
 
-    unexported = database.get_unexported_leads()
-    if not unexported:
-        logger.info("No unexported leads to send to Google Sheets.")
-        return
+        jobs = source.fetch_jobs(search_terms=(), countries=())
 
-    try:
-        exporter = GoogleSheetExporter(
-            sheet_id=settings.google_sheet_id,
-            service_account_file=settings.google_service_account_file,
+        assert len(jobs) == 2  # third entry missing absolute_url, skipped
+        assert jobs[0].company == "Acme Corp"
+        assert jobs[0].job_title == "Paid Media Manager"
+        assert jobs[0].location == "Dubai, UAE"
+        assert jobs[0].source == "greenhouse"
+        assert jobs[0].posted_date == date(2026, 7, 5)
+
+    def test_strips_html_from_description(self) -> None:
+        session = _mock_session(GREENHOUSE_VALID_RESPONSE)
+        source = GreenhouseSource(targets=ACME_TARGETS, session=session)
+
+        jobs = source.fetch_jobs(search_terms=(), countries=())
+
+        assert "<" not in jobs[0].description
+        assert "growth team" in jobs[0].description
+
+    def test_empty_board_returns_empty_list(self) -> None:
+        session = _mock_session(GREENHOUSE_EMPTY_RESPONSE)
+        source = GreenhouseSource(targets=ACME_TARGETS, session=session)
+
+        assert source.fetch_jobs(search_terms=(), countries=()) == []
+
+    def test_ignores_search_terms_and_countries(self) -> None:
+        # These params exist only to satisfy the JobSource interface -
+        # Greenhouse has no keyword search, it returns everything.
+        session = _mock_session(GREENHOUSE_EMPTY_RESPONSE)
+        source = GreenhouseSource(targets=ACME_TARGETS, session=session)
+
+        source.fetch_jobs(search_terms=("anything",), countries=("gb", "us"))
+
+        assert session.request.call_count == 1  # one call per target, not per country
+
+    def test_queries_once_per_target(self) -> None:
+        two_targets = (
+            AtsTarget(slug="acme", company_name="Acme Corp"),
+            AtsTarget(slug="beta", company_name="Beta Inc"),
         )
-        exported_hashes = exporter.export_leads(unexported)
-        database.mark_exported(exported_hashes)
-        logger.info("Exported %d lead(s) to Google Sheets.", len(exported_hashes))
-    except GoogleSheetError as exc:
-        logger.error("Google Sheets export failed, leads remain unexported: %s", exc)
-    except Exception as exc:  # noqa: BLE001 - defensive: export must never
-        # crash the run, same principle as per-source isolation in the
-        # orchestrator. Anything not already wrapped as GoogleSheetError
-        # still needs to be caught here rather than propagate.
-        logger.exception("Unexpected error during Google Sheets export, leads remain unexported: %s", exc)
+        session = _mock_session(GREENHOUSE_EMPTY_RESPONSE)
+        source = GreenhouseSource(targets=two_targets, session=session)
+
+        source.fetch_jobs(search_terms=(), countries=())
+
+        assert session.request.call_count == 2
+
+    def test_raises_source_error_after_retries_exhausted(self, monkeypatch: pytest.MonkeyPatch) -> None:
+        session = MagicMock()
+        session.request.side_effect = requests.ConnectionError("network down")
+        source = GreenhouseSource(targets=ACME_TARGETS, session=session)
+        monkeypatch.setattr("sources.http_utils.time.sleep", lambda _: None)
+
+        with pytest.raises(SourceError, match="Greenhouse"):
+            source.fetch_jobs(search_terms=(), countries=())
 
 
-def main() -> int:
-    """Application entrypoint. Returns a process exit code."""
-    try:
-        settings = get_settings()
-    except ConfigError as exc:
-        print(f"Configuration error: {exc}", file=sys.stderr)
-        return 1
+class TestLeverSource:
+    def test_requires_at_least_one_target(self) -> None:
+        with pytest.raises(ValueError, match="at least one"):
+            LeverSource(targets=())
 
-    configure_logging(settings.log_level, settings.log_file)
-    logger = get_logger(__name__)
+    def test_returns_normalized_jobs_and_skips_incomplete(self) -> None:
+        session = _mock_session(LEVER_VALID_RESPONSE)
+        source = LeverSource(targets=ACME_TARGETS, session=session)
 
-    logger.info("ActiPlan Lead Discovery Engine starting up")
-    logger.info(
-        "Discovery sources enabled: jooble=%s adzuna=%s",
-        settings.sources.jooble_enabled,
-        settings.sources.adzuna_enabled,
-    )
+        jobs = source.fetch_jobs(search_terms=(), countries=())
 
-    try:
-        scoring_engine = ScoringEngine.from_file(settings.title_scores_file)
-    except ScoringConfigError as exc:
-        logger.error("Failed to load scoring configuration: %s", exc)
-        return 1
+        assert len(jobs) == 2  # third entry missing text/title, skipped
+        assert jobs[0].company == "Acme Corp"
+        assert jobs[0].job_title == "Media Buyer"
+        assert jobs[0].location == "London"
+        assert jobs[0].source == "lever"
 
-    job_filter = JobFilter(
-        canonical_titles=scoring_engine.canonical_titles,
-        threshold=settings.fuzzy_match_threshold,
-    )
-    sources = _build_sources(settings)
+    def test_handles_bare_array_response_shape(self) -> None:
+        # Lever's response is a raw JSON array, not wrapped in an object -
+        # this is the detail most likely to be implemented wrong.
+        session = _mock_session(LEVER_EMPTY_RESPONSE)
+        source = LeverSource(targets=ACME_TARGETS, session=session)
 
-    with Database(settings.database_path) as database:
-        database.initialize_schema()
+        assert source.fetch_jobs(search_terms=(), countries=()) == []
 
-        orchestrator = Orchestrator(
-            sources=sources,
-            database=database,
-            job_filter=job_filter,
-            scoring_engine=scoring_engine,
-            search_terms=settings.search_terms,
-            search_countries=settings.search_countries,
-            min_score=settings.min_score,
-        )
-        stats = orchestrator.run()
-        _export_leads(settings, database)
+    def test_parses_epoch_millisecond_created_at(self) -> None:
+        session = _mock_session(LEVER_VALID_RESPONSE)
+        source = LeverSource(targets=ACME_TARGETS, session=session)
 
-    if stats.errors:
-        logger.warning("Run completed with %d error(s) - see log above for details.", len(stats.errors))
+        jobs = source.fetch_jobs(search_terms=(), countries=())
 
-    return 0
+        assert jobs[0].posted_date is not None
+        assert isinstance(jobs[0].posted_date, date)
+
+    def test_falls_back_to_apply_url_when_hosted_url_missing(self) -> None:
+        response = [
+            {
+                "id": "x",
+                "text": "Campaign Manager",
+                "hostedUrl": "",
+                "applyUrl": "https://jobs.lever.co/acme/x/apply",
+                "categories": {"location": "Paris"},
+                "createdAt": 1783036800000,
+                "descriptionPlain": "desc",
+            }
+        ]
+        session = _mock_session(response)
+        source = LeverSource(targets=ACME_TARGETS, session=session)
+
+        jobs = source.fetch_jobs(search_terms=(), countries=())
+
+        assert jobs[0].job_url == "https://jobs.lever.co/acme/x/apply"
 
 
-if __name__ == "__main__":
-    sys.exit(main())
+class TestAshbySource:
+    def test_requires_at_least_one_target(self) -> None:
+        with pytest.raises(ValueError, match="at least one"):
+            AshbySource(targets=())
+
+    def test_returns_normalized_jobs_and_skips_incomplete(self) -> None:
+        session = _mock_session(ASHBY_VALID_RESPONSE)
+        source = AshbySource(targets=ACME_TARGETS, session=session)
+
+        jobs = source.fetch_jobs(search_terms=(), countries=())
+
+        assert len(jobs) == 2  # third entry missing title, skipped
+        assert jobs[0].company == "Acme Corp"
+        assert jobs[0].job_title == "Performance Marketing Manager"
+        assert jobs[0].location == "Doha, Qatar"
+        assert jobs[0].source == "ashby"
+        assert jobs[0].posted_date == date(2026, 7, 6)
+
+    def test_empty_board_returns_empty_list(self) -> None:
+        session = _mock_session(ASHBY_EMPTY_RESPONSE)
+        source = AshbySource(targets=ACME_TARGETS, session=session)
+
+        assert source.fetch_jobs(search_terms=(), countries=()) == []
+
+    def test_parses_iso_date_with_milliseconds_and_offset(self) -> None:
+        session = _mock_session(ASHBY_VALID_RESPONSE)
+        source = AshbySource(targets=ACME_TARGETS, session=session)
+
+        jobs = source.fetch_jobs(search_terms=(), countries=())
+
+        assert jobs[1].posted_date == date(2026, 7, 5)

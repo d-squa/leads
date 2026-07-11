@@ -1,82 +1,48 @@
 """
-ATS watchlist loading.
+Deduplicator.
 
-Greenhouse, Lever, and Ashby are all polled per-company via a known
-board slug - there's no keyword search across companies. This module
-loads that slug list from a small JSON file (config/ats_watchlist.json)
-so new companies can be added without touching code.
+Wraps storage/database.py's jobs_seen ledger with an in-memory set for
+the current run. This matters because a single run can legitimately
+see the same job twice - e.g. the same posting turning up for both
+"paid media" and "PPC" search terms, or once per country query if a
+remote role is tagged in multiple locations. Without the in-run cache,
+each of those would trigger a redundant DB write; with it, only the
+first sighting per run touches the database.
 
-Each entry pairs a slug with a company_name, because ATS responses
-don't include the company's display name - you already have to know
-it, since you're querying by slug in the URL.
+The persistent, cross-run guarantee ("never insert the same job
+twice, ever") still lives in storage/database.py's UNIQUE constraints -
+this class is a performance/clarity layer on top, not a replacement.
 """
 from __future__ import annotations
 
-import json
-from dataclasses import dataclass
-from pathlib import Path
-
-from utils.logger import get_logger
-
-logger = get_logger(__name__)
-
-_SUPPORTED_PLATFORMS = ("greenhouse", "lever", "ashby")
+from models.job import Job
+from storage.database import Database
 
 
-class AtsWatchlistError(Exception):
-    """Raised when the ATS watchlist file is missing or malformed."""
+class Deduplicator:
+    """Tracks which jobs have already been seen, this run and across
+    all previous runs."""
 
+    def __init__(self, database: Database) -> None:
+        self._database = database
+        self._seen_this_run: set[str] = set()
 
-@dataclass(frozen=True)
-class AtsTarget:
-    """A single company to poll on a given ATS platform."""
+    def is_new(self, job: Job) -> bool:
+        """Return True if this is the first time this job has ever been
+        seen (this run or any prior run), and record it as seen.
 
-    slug: str
-    company_name: str
+        Returns False for any repeat - whether the repeat is within
+        this run or from a previous day's run.
+        """
+        job_hash = job.dedup_hash()
 
+        if job_hash in self._seen_this_run:
+            return False
 
-def load_ats_watchlist(path: Path) -> dict[str, tuple[AtsTarget, ...]]:
-    """Load the ATS watchlist file into per-platform tuples of AtsTarget.
+        self._seen_this_run.add(job_hash)
 
-    Returns a dict with keys "greenhouse", "lever", "ashby", each
-    mapping to a (possibly empty) tuple of AtsTarget. A platform with
-    no entries configured simply gets an empty tuple - callers use
-    that to decide whether to build a connector for it at all.
+        if self._database.has_seen(job_hash):
+            return False
 
-    Raises:
-        AtsWatchlistError: if the file is missing, isn't valid JSON,
-            or an entry is missing "slug"/"company_name".
-    """
-    try:
-        raw_text = path.read_text(encoding="utf-8")
-    except OSError as exc:
-        raise AtsWatchlistError(f"Could not read ATS watchlist file {path}: {exc}") from exc
-
-    try:
-        raw_data = json.loads(raw_text)
-    except json.JSONDecodeError as exc:
-        raise AtsWatchlistError(f"ATS watchlist file {path} is not valid JSON: {exc}") from exc
-
-    result: dict[str, tuple[AtsTarget, ...]] = {}
-    for platform in _SUPPORTED_PLATFORMS:
-        entries = raw_data.get(platform, [])
-        if not isinstance(entries, list):
-            raise AtsWatchlistError(
-                f"ATS watchlist file {path}: {platform!r} must be a list, got {type(entries).__name__}."
-            )
-
-        targets: list[AtsTarget] = []
-        for entry in entries:
-            slug = str(entry.get("slug", "")).strip()
-            company_name = str(entry.get("company_name", "")).strip()
-            if not slug or not company_name:
-                raise AtsWatchlistError(
-                    f"ATS watchlist file {path}: each {platform!r} entry needs a non-empty "
-                    f"'slug' and 'company_name', got {entry!r}."
-                )
-            targets.append(AtsTarget(slug=slug, company_name=company_name))
-
-        result[platform] = tuple(targets)
-        logger.info("Loaded %d %s watchlist target(s) from %s", len(targets), platform, path)
-
-    return result
+        self._database.mark_seen(job)
+        return True
